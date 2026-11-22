@@ -117,9 +117,16 @@ struct Attributes {
 };
 
 // Each skill's difficulty at each object from the map's second, in time
-// order (osu!'s Skill.GetObjectDifficulties).
+// order (osu!'s Skill.GetObjectDifficulties). And each skill's weight: what
+// its difficulty value is per unit of a difficulty every object shared,
+// osu!'s weight sum for speed and reading (HarmonicSkill.ObjectWeightSum)
+// and 1 / (1 - the decay weight) for aim, as osu!'s CountTopWeighted counts
+// take them. The rating the map would have for a skill, were every object as
+// hard as one, is that object's difficulty times the weight, rated
+// (aim_rating, rating).
 struct ObjectDifficulties {
   std::vector<double> aim, aim_no_sliders, speed, reading, flashlight;
+  double              aim_weight = 0, speed_weight = 0, reading_weight = 0;
 };
 
 struct Difficulty {
@@ -134,8 +141,16 @@ struct TimedAttributes {
   Attributes attributes;
 };
 
-Difficulty                   calculate(const Beatmap& map, const Mods& mods);
-std::vector<TimedAttributes> calculate_timed(const Beatmap& map, const Mods& mods);
+inline Difficulty                   calculate(const Beatmap& map, const Mods& mods);
+inline std::vector<TimedAttributes> calculate_timed(const Beatmap& map, const Mods& mods);
+
+// osu!'s ratings of a skill's difficulty value: aim's, and speed's,
+// reading's and flashlight's.
+inline double aim_rating(double difficulty_value);
+inline double rating(double difficulty_value);
+// The star rating skills' ratings make; flashlight's with Flashlight only.
+inline double star_rating(double aim, double speed, double reading,
+                          std::optional<double> flashlight);
 
 namespace detail {
 
@@ -1775,15 +1790,8 @@ struct Calculation {
     std::optional<double> flashlight_rating;
     if (flashlight)
       flashlight_rating = difficulty_rating(flashlight->difficulty_value());
-    const double base_aim = aim_difficulty_to_performance(aim_rating);
-    const double base_speed = harmonic_difficulty_to_performance(speed_rating);
-    const double base_reading = harmonic_difficulty_to_performance(reading_rating);
-    const double base_flashlight =
-        flashlight_rating ? Flashlight::difficulty_to_performance(*flashlight_rating) : 0.0;
-    const double base_cognition = sum_cognition_difficulty(base_reading, base_flashlight);
-    const double base_performance =
-        norm(performance_norm_exponent, base_aim, base_speed, base_cognition);
-    a.star_rating = std::cbrt(base_performance * performance_base_multiplier);
+    a.star_rating = osu_pp::star_rating(aim_rating, speed_rating, reading_rating,
+                                        flashlight_rating);
     a.aim = aim_rating;
     a.aim_difficult_slider_count = difficult_sliders;
     a.speed = speed_rating;
@@ -1802,6 +1810,26 @@ struct Calculation {
 
 }  // namespace detail
 
+inline double aim_rating(double difficulty_value) {
+  return detail::aim_difficulty_rating(difficulty_value);
+}
+inline double rating(double difficulty_value) {
+  return detail::difficulty_rating(difficulty_value);
+}
+inline double star_rating(double aim, double speed, double reading,
+                          std::optional<double> flashlight) {
+  using namespace detail;
+  const double base_aim = aim_difficulty_to_performance(aim);
+  const double base_speed = harmonic_difficulty_to_performance(speed);
+  const double base_reading = harmonic_difficulty_to_performance(reading);
+  const double base_flashlight =
+      flashlight ? Flashlight::difficulty_to_performance(*flashlight) : 0.0;
+  const double base_cognition = sum_cognition_difficulty(base_reading, base_flashlight);
+  const double base_performance =
+      norm(performance_norm_exponent, base_aim, base_speed, base_cognition);
+  return std::cbrt(base_performance * performance_base_multiplier);
+}
+
 inline Difficulty calculate(const Beatmap& map, const Mods& mods) {
   detail::Calculation c(map, mods);
   for (const size_t i : c.order)
@@ -1814,6 +1842,10 @@ inline Difficulty calculate(const Beatmap& map, const Mods& mods) {
   result.objects.reading = c.reading.object_difficulties;
   if (c.flashlight)
     result.objects.flashlight = c.flashlight->object_difficulties;
+  // Rating the map summed speed's and reading's weights.
+  result.objects.aim_weight = 1 / (1 - c.aim.decay_weight);
+  result.objects.speed_weight = c.speed.object_weight_sum;
+  result.objects.reading_weight = c.reading.object_weight_sum;
   return result;
 }
 
