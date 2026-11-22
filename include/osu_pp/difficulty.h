@@ -1806,7 +1806,8 @@ inline Difficulty calculate(const Beatmap& map, const Mods& mods) {
   detail::Calculation c(map, mods);
   for (const size_t i : c.order)
     c.process(c.difficulty_objects[i]);
-  Difficulty result{.attributes = c.attributes(c.objects.size())};
+  Difficulty result;
+  result.attributes = c.attributes(c.objects.size());
   result.objects.aim = c.aim.object_difficulties;
   result.objects.aim_no_sliders = c.aim_no_sliders.object_difficulties;
   result.objects.speed = c.speed.object_difficulties;
