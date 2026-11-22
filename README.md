@@ -22,6 +22,10 @@ osu! shows.
 - **Timed attributes**: the attributes counting the map only up to each
   object (osu!'s `CalculateTimed`), for ratings as a map is played.
 
+- **osu!'s rating formulas**, for working with the parts: a skill's rating
+  from its difficulty value (`aim_rating`, `rating`), and the star rating
+  from the skills' ratings (`star_rating`).
+
 It doesn't calculate performance points (pp), legacy score or max combo.
 
 ## Using it
