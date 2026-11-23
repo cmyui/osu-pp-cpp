@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <optional>
@@ -231,6 +232,16 @@ inline int compare(double a, double b) {
 }
 // Math.Round: halves to even.
 inline double round_half_even(double x) { return std::nearbyint(x); }
+// (int) of a double: toward zero, saturating, NaN as 0, as .NET 9 and later
+// convert.
+inline int net_int(double x) {
+  if (std::isnan(x))
+    return 0;
+  return static_cast<int>(net_clamp(x, std::numeric_limits<int>::min(),
+                                    std::numeric_limits<int>::max()));
+}
+// int arithmetic unchecked, as C#'s is: the result modulo 2^32.
+inline int int_wrap(long long x) { return static_cast<int>(x); }
 // double.Lerp: a fused multiply-add where the hardware has one, as .NET's
 // MultiplyAddEstimate is.
 inline double net_lerp(double a, double b, double t) {
@@ -1733,8 +1744,8 @@ struct Flashlight : StrainSkill {
 
 // ------------ osu.Game/Rulesets/Objects/Legacy/LegacyRulesetExtensions.cs
 
-// A float as C#'s (decimal)(double) holds it, to its 15 significant digits,
-// in units of 1e-16. Settings are under 100, and none between 0 and 0.01
+// A float, under 100 either way, as C#'s (decimal)(double) holds it: to its
+// 15 significant digits, in units of 1e-16. No setting between 0 and 0.01
 // keeps a digit it would round off here.
 inline long long decimal_e16(float value) {
   if (value == 0)
@@ -1778,15 +1789,13 @@ inline int compare_fractions(unsigned long long a,
 // together over 38, times 5, rounded half to even. osu! works this out in
 // C#'s decimal, as osu!stable's 80-bit floats come closest to; it's exact
 // here, which rounds the same: a value off a half by decimal's rounding is
-// off it by far more exactly.
+// off it by far more exactly. Settings of 100 or more, which no map has, are
+// in double, as near as it comes.
 inline int difficulty_peppy_stars(float drain_rate,
                                   float overall_difficulty,
                                   float circle_size,
                                   int   object_count,
                                   int   drain_length) {
-  const long long settings = decimal_e16(drain_rate) +
-                             decimal_e16(overall_difficulty) +
-                             decimal_e16(circle_size);
   // The objects per second of drain times 8, clamped, as ratio / per.
   long long ratio = 16, per = 1;
   if (drain_length != 0) {
@@ -1803,22 +1812,34 @@ inline int difficulty_peppy_stars(float drain_rate,
       per = 1;
     }
   }
-  // The stars are the halves, n + 0.5, the value is above, where the
-  // settings and the ratio together are 3.8 (2n + 1); on a half, the even
-  // of n and n + 1.
-  for (int stars = 0;; ++stars) {
-    // 3.8 (2n + 1) less the settings, in units of 1e-16, for the ratio.
-    const long long half =
-        38LL * (2 * stars + 1) * 1'000'000'000'000'000 - settings;
-    const int above =
-        half < 0 ? 1
-                 : compare_fractions(ratio, per, half,
-                                     10'000'000'000'000'000);  // 1e16
-    if (above < 0)
-      return stars;
-    if (above == 0)
-      return stars + stars % 2;
-  }
+  const double estimate =
+      (static_cast<double>(drain_rate) + overall_difficulty + circle_size +
+       static_cast<double>(ratio) / per) /
+      38 * 5;
+  const auto usual = [](float value) { return std::abs(value) < 100; };
+  if (!usual(drain_rate) || !usual(overall_difficulty) || !usual(circle_size))
+    return net_int(round_half_even(estimate));
+
+  const long long settings = decimal_e16(drain_rate) +
+                             decimal_e16(overall_difficulty) +
+                             decimal_e16(circle_size);
+  // Whether the value is above, on or below n + 0.5, where the settings and
+  // the ratio together are 3.8 (2n + 1): the ratio against 3.8 (2n + 1) less
+  // the settings, in units of 1e-16.
+  const auto against_half = [&](long long n) {
+    const long long half = 38 * (2 * n + 1) * 1'000'000'000'000'000 - settings;
+    return half < 0 ? 1
+                    : compare_fractions(ratio, per, half,
+                                        10'000'000'000'000'000);  // 1e16
+  };
+  // The estimate is off by far less than a half, so the halves either side
+  // of it say which way the value rounds: on one, to the even.
+  const long long n = static_cast<long long>(round_half_even(estimate));
+  if (const int above = against_half(n); above >= 0)
+    return static_cast<int>(above > 0 || n % 2 != 0 ? n + 1 : n);
+  if (const int below = against_half(n - 1); below <= 0)
+    return static_cast<int>(below < 0 || n % 2 != 0 ? n - 1 : n);
+  return static_cast<int>(n);
 }
 
 // --------------- osu.Game.Rulesets.Osu/Difficulty/Utils/LegacyScoreUtils.cs
@@ -1828,13 +1849,12 @@ inline int difficulty_peppy_stars(float drain_rate,
 inline int drain_length(const Beatmap& map) {
   if (map.objects.empty())
     return 0;
-  int breaks = 0;
+  const auto ms = [](double time) { return net_int(round_half_even(time)); };
+  int        breaks = 0;
   for (const Break& b : map.breaks)
-    breaks += static_cast<int>(round_half_even(b.end_time)) -
-              static_cast<int>(round_half_even(b.start_time));
-  return (static_cast<int>(round_half_even(map.objects.back().start_time)) -
-          static_cast<int>(round_half_even(map.objects.front().start_time)) -
-          breaks) /
+    breaks = int_wrap(1LL * breaks + ms(b.end_time) - ms(b.start_time));
+  return int_wrap(1LL * ms(map.objects.back().start_time) -
+                  ms(map.objects.front().start_time) - breaks) /
          1000;
 }
 
@@ -1847,16 +1867,17 @@ inline double spinner_score(const HitObject& spinner) {
   constexpr double minimum_rotations_per_second = 3;
   const double     seconds = (spinner.end_time - spinner.start_time) / 1000;
   const int total_half_spins =
-      static_cast<int>(seconds * maximum_rotations_per_second * 2);
+      net_int(seconds * maximum_rotations_per_second * 2);
   const int half_spins_to_complete =
-      static_cast<int>(seconds * minimum_rotations_per_second);
-  const int half_spins_before_bonus = half_spins_to_complete + 3;
+      net_int(seconds * minimum_rotations_per_second);
+  const int half_spins_before_bonus = int_wrap(half_spins_to_complete + 3LL);
   long long score = 0;
   const int full_spins = total_half_spins / 2;
-  score += 100LL * full_spins;
-  int bonus_spins = (total_half_spins - half_spins_before_bonus) / 2;
-  bonus_spins = std::max(0, bonus_spins - full_spins / 2);
-  score += 1000LL * bonus_spins;
+  score += int_wrap(100LL * full_spins);
+  int bonus_spins =
+      int_wrap(1LL * total_half_spins - half_spins_before_bonus) / 2;
+  bonus_spins = std::max(0, int_wrap(1LL * bonus_spins - full_spins / 2));
+  score += int_wrap(1000LL * bonus_spins);
   return static_cast<double>(score);
 }
 
@@ -1870,7 +1891,7 @@ inline double nested_score_per_object(const std::vector<HitObject>& objects,
     const HitObject& h = objects[i];
     if (h.kind == HitObject::slider) {
       // Its head, its tail and its repeats.
-      big_ticks += 2 + h.repeat_count;
+      big_ticks = int_wrap(2LL + big_ticks + h.repeat_count);
       for (const NestedObject& n : h.nested)
         small_ticks += n.kind == NestedObject::tick;
     } else if (h.kind == HitObject::spinner) {
@@ -1897,8 +1918,7 @@ inline LegacyCombo legacy_combo(const std::vector<HitObject>& objects,
   LegacyCombo c;
   const auto  hit = [&](int score, bool adds_combo, bool combo_bonus) {
     if (combo_bonus)
-      c.score += static_cast<int>(std::max(0, c.combo - 1) *
-                                  (score / 25 * multiplier));
+      c.score += net_int(std::max(0, c.combo - 1) * (score / 25 * multiplier));
     if (adds_combo)
       ++c.combo;
   };
