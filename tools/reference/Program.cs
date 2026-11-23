@@ -7,9 +7,13 @@
 // Usage: reference [--timed] [--no-classic] <mods> <out.txt> <map.osu>
 //
 // <mods> is "NM", or comma-separated acronyms: HD, HR, EZ, DT, NC, HT, DC,
-// FL, TD, RX, AP; a rate mod takes "@rate" (DT@1.3), and DA takes settings
-// (DA:cs=7:ar=10:od=9). Classic is added unless --no-classic, as osu!'s
-// servers rate maps with it.
+// FL, TD, RX, AP, NF, SO, BL, TC, SV2; a rate mod takes "@rate" (DT@1.3),
+// and DA takes settings (DA:cs=7:ar=10:od=9). Classic is added unless
+// --no-classic, as osu!'s servers rate maps with it.
+//
+// Then osu!'s pp for a spread of made-up scores with those mods (score and
+// performance lines), with the map's own settings and breaks, which its
+// osu!stable score multiplier needs.
 
 using System.Globalization;
 using System.Reflection;
@@ -24,6 +28,8 @@ using osu.Game.Rulesets.Osu.Difficulty;
 using osu.Game.Rulesets.Osu.Difficulty.Skills;
 using osu.Game.Rulesets.Osu.Mods;
 using osu.Game.Rulesets.Osu.Objects;
+using osu.Game.Rulesets.Scoring;
+using osu.Game.Scoring;
 using osu.Game.Utils;
 
 var arguments = args.ToList();
@@ -45,6 +51,11 @@ string r(double value) => value.ToString("R", CultureInfo.InvariantCulture);
 string f(float value) => value.ToString("R", CultureInfo.InvariantCulture);
 
 output.AppendLine($"difficulty {f(beatmap.Difficulty.CircleSize)} {f(beatmap.Difficulty.ApproachRate)} {f(beatmap.Difficulty.OverallDifficulty)} {r(ModUtils.CalculateRateWithMods(mods))}");
+output.AppendLine($"drain {f(beatmap.Difficulty.DrainRate)}");
+var own = working.Beatmap.Difficulty;
+output.AppendLine($"own {f(own.CircleSize)} {f(own.OverallDifficulty)} {f(own.DrainRate)}");
+foreach (var b in working.Beatmap.Breaks)
+    output.AppendLine($"break {r(b.StartTime)} {r(b.EndTime)}");
 output.AppendLine("mods " + string.Join(' ', mods.Select(m => m.Acronym)));
 
 var pathField = typeof(SliderPath).GetField("calculatedPath", BindingFlags.NonPublic | BindingFlags.Instance)!;
@@ -90,6 +101,62 @@ output.AppendLine($"attribute speed_difficult_strain_count {r(attributes.SpeedDi
 output.AppendLine($"attribute reading_difficult_note_count {r(attributes.ReadingDifficultNoteCount)}");
 output.AppendLine($"attribute aim_top_weighted_slider_factor {r(attributes.AimTopWeightedSliderFactor)}");
 output.AppendLine($"attribute speed_top_weighted_slider_factor {r(attributes.SpeedTopWeightedSliderFactor)}");
+output.AppendLine($"attribute max_combo {attributes.MaxCombo}");
+output.AppendLine($"attribute hit_circle_count {attributes.HitCircleCount}");
+output.AppendLine($"attribute slider_count {attributes.SliderCount}");
+output.AppendLine($"attribute spinner_count {attributes.SpinnerCount}");
+output.AppendLine($"attribute nested_score_per_object {r(attributes.NestedScorePerObject)}");
+output.AppendLine($"attribute legacy_score_base_multiplier {r(attributes.LegacyScoreBaseMultiplier)}");
+output.AppendLine($"attribute maximum_legacy_combo_score {r(attributes.MaximumLegacyComboScore)}");
+
+// Made-up scores across what the calculation branches on: full combos and
+// broken ones, 100s, 50s and misses, slider tails dropped and ticks missed,
+// and an osu!stable total or none.
+int objects = beatmap.HitObjects.Count;
+int sliders = attributes.SliderCount;
+var shapes = new (int ok, int meh, int miss, double combo, int tailsDropped, int ticksMissed)[]
+{
+    (0, 0, 0, 1, 0, 0),
+    (objects / 20, 0, 0, 1, 0, 0),
+    (objects / 30, objects / 100, objects / 50 + 1, 0.33, sliders / 10, sliders / 20),
+    (objects / 10, objects / 40, objects / 8 + 1, 0.05, sliders / 4, sliders / 8),
+    (0, 0, 0, 0.97, Math.Min(sliders, 3), 0),
+    (objects / 3, objects / 5, 0, 0.5, sliders / 2, 0),
+};
+long[] totals = { 0, 50_000, 2_000_000, 40_000_000, 2_000_000_000 };
+foreach (var (ok, meh, miss, combo, tailsDropped, ticksMissed) in shapes)
+{
+    int great = Math.Max(0, objects - ok - meh - miss);
+    int maxCombo = (int)(attributes.MaxCombo * combo);
+    double accuracy = objects == 0 ? 1 : (300.0 * great + 100.0 * ok + 50.0 * meh) / (300.0 * objects);
+    foreach (long total in totals)
+    {
+        var score = new ScoreInfo
+        {
+            Ruleset = ruleset.RulesetInfo,
+            BeatmapInfo = working.BeatmapInfo,
+            Mods = mods,
+            Accuracy = accuracy,
+            MaxCombo = maxCombo,
+            LegacyTotalScore = total == 0 ? null : total,
+            Statistics = new Dictionary<HitResult, int>
+            {
+                [HitResult.Great] = great,
+                [HitResult.Ok] = ok,
+                [HitResult.Meh] = meh,
+                [HitResult.Miss] = miss,
+                [HitResult.SliderTailHit] = sliders - tailsDropped,
+                [HitResult.LargeTickMiss] = ticksMissed,
+            },
+        };
+        // A calculator each: osu!'s keeps a score's estimated slider breaks
+        // and sets them only for one with misses.
+        var p = (OsuPerformanceAttributes)ruleset.CreatePerformanceCalculator()!.Calculate(score, attributes);
+        string o(double? v) => v is double d ? r(d) : "none";
+        output.AppendLine($"score {r(accuracy)} {maxCombo} {great} {ok} {meh} {miss} {sliders - tailsDropped} {ticksMissed} {(total == 0 ? "none" : total.ToString())}");
+        output.AppendLine($"performance {r(p.Aim)} {r(p.Speed)} {r(p.Accuracy)} {r(p.Flashlight)} {r(p.Reading)} {r(p.EffectiveMissCount)} {r(p.ComboBasedEstimatedMissCount)} {o(p.ScoreBasedEstimatedMissCount)} {r(p.AimEstimatedSliderBreaks)} {r(p.SpeedEstimatedSliderBreaks)} {o(p.SpeedDeviation)} {r(p.Total)}");
+    }
+}
 
 foreach (var skill in calculator.Skills)
 {
