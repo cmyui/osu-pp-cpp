@@ -15,10 +15,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <numbers>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace osu_pp {
@@ -75,6 +77,12 @@ struct HitObject {
   std::vector<NestedObject> nested;  // in osu!lazer's NestedHitObjects order
 };
 
+// A break in a map, as its file gives it.
+struct Break {
+  double start_time = 0;  // ms
+  double end_time = 0;
+};
+
 // A map as osu!lazer makes it playable with a play's mods: the settings in
 // single precision, as osu!lazer keeps them, after Easy, Hard Rock and
 // Difficulty Adjust; objects in its order, with Hard Rock's flip applied,
@@ -83,7 +91,15 @@ struct Beatmap {
   float                  circle_size = 5;
   float                  approach_rate = 5;
   float                  overall_difficulty = 5;
+  float                  drain_rate = 5;  // read only by Blinds' pp
   std::vector<HitObject> objects;
+
+  // The map's own settings, before mods, and its breaks: osu!stable's
+  // score multiplier is the map's own (see legacy_score_base_multiplier).
+  float              own_circle_size = 5;
+  float              own_overall_difficulty = 5;
+  float              own_drain_rate = 5;
+  std::vector<Break> breaks;
 };
 
 // The mods the calculation reads, besides those already applied to the map.
@@ -97,6 +113,20 @@ struct Mods {
   bool   autopilot = false;
   float  magnetised = 0;            // osu!lazer's attraction strength, or 0
   float  deflate_start_scale = 0;   // osu!lazer's Deflate, or 0 without
+
+  // Read only by performance (see performance.h). Classic's slider accuracy
+  // is osu!lazer's Classic mod's "No slider head accuracy", as osu!stable
+  // judges sliders; osu! gives it to every score set on osu!stable.
+  bool no_fail = false;
+  bool easy = false;
+  bool half_time = false;    // or Daycore
+  bool hard_rock = false;
+  bool double_time = false;  // or Nightcore
+  bool spun_out = false;
+  bool blinds = false;
+  bool traceable = false;
+  bool score_v2 = false;
+  bool classic_slider_accuracy = false;
 };
 
 // OsuDifficultyAttributes' difficulty values.
@@ -114,6 +144,19 @@ struct Attributes {
   double                reading_difficult_note_count = 0;
   double                aim_top_weighted_slider_factor = 0;
   double                speed_top_weighted_slider_factor = 0;
+
+  // And those osu!'s performance calculation reads besides: the objects'
+  // counts and the map's max combo, and from osu!stable's scoring (see
+  // LegacyScoreUtils and OsuLegacyScoreSimulator) the score of an average
+  // object's slider ticks and spinner spins, the map's score multiplier,
+  // and the combo bonus a full combo makes.
+  int    max_combo = 0;
+  int    hit_circle_count = 0;
+  int    slider_count = 0;
+  int    spinner_count = 0;
+  double nested_score_per_object = 0;
+  double legacy_score_base_multiplier = 0;
+  double maximum_legacy_combo_score = 0;
 };
 
 // Each skill's difficulty at each object from the map's second, in time
@@ -1688,6 +1731,191 @@ struct Flashlight : StrainSkill {
   }
 };
 
+// ------------ osu.Game/Rulesets/Objects/Legacy/LegacyRulesetExtensions.cs
+
+// A float as C#'s (decimal)(double) holds it, to its 15 significant digits,
+// in units of 1e-16. Settings are under 100, and none between 0 and 0.01
+// keeps a digit it would round off here.
+inline long long decimal_e16(float value) {
+  if (value == 0)
+    return 0;
+  char text[32];
+  std::snprintf(text, sizeof text, "%.14e", static_cast<double>(value));
+  const bool  negative = text[0] == '-';
+  long long   digits = 0;
+  const char* p = text + negative;
+  for (; *p && *p != 'e'; ++p)
+    if (*p >= '0' && *p <= '9')
+      digits = digits * 10 + (*p - '0');
+  // The digits are value * 10^(14 - exponent); a unit is 1e-16.
+  for (int shift = std::atoi(p + 1) + 2; shift != 0; shift += shift < 0 ? 1 : -1)
+    digits = shift > 0 ? digits * 10 : digits / 10;
+  return negative ? -digits : digits;
+}
+
+// a / b against c / d, for numerators from 0 and denominators above 0:
+// below 0, 0 or above 0 as a / b is less, equal or more. By their continued
+// fractions, so nothing overflows.
+inline int compare_fractions(unsigned long long a,
+                             unsigned long long b,
+                             unsigned long long c,
+                             unsigned long long d) {
+  for (int sign = 1;; sign = -sign) {
+    if (a / b != c / d)
+      return a / b < c / d ? -sign : sign;
+    a %= b;
+    c %= d;
+    if (a == 0 || c == 0)
+      return a == c ? 0 : a == 0 ? -sign : sign;
+    // Below 1 both: a / b is less exactly when b / a is more.
+    std::swap(a, b);
+    std::swap(c, d);
+  }
+}
+
+// osu!stable's score multiplier, its "difficulty peppy stars": the map's
+// own HP, OD and CS, and its objects per second of drain times 8, up to 16,
+// together over 38, times 5, rounded half to even. osu! works this out in
+// C#'s decimal, as osu!stable's 80-bit floats come closest to; it's exact
+// here, which rounds the same: a value off a half by decimal's rounding is
+// off it by far more exactly.
+inline int difficulty_peppy_stars(float drain_rate,
+                                  float overall_difficulty,
+                                  float circle_size,
+                                  int   object_count,
+                                  int   drain_length) {
+  const long long settings = decimal_e16(drain_rate) +
+                             decimal_e16(overall_difficulty) +
+                             decimal_e16(circle_size);
+  // The objects per second of drain times 8, clamped, as ratio / per.
+  long long ratio = 16, per = 1;
+  if (drain_length != 0) {
+    ratio = 8LL * object_count;
+    per = drain_length;
+    if (per < 0) {
+      ratio = -ratio;
+      per = -per;
+    }
+    if (ratio < 0)
+      ratio = 0;
+    if (ratio > 16 * per) {
+      ratio = 16;
+      per = 1;
+    }
+  }
+  // The stars are the halves, n + 0.5, the value is above, where the
+  // settings and the ratio together are 3.8 (2n + 1); on a half, the even
+  // of n and n + 1.
+  for (int stars = 0;; ++stars) {
+    // 3.8 (2n + 1) less the settings, in units of 1e-16, for the ratio.
+    const long long half =
+        38LL * (2 * stars + 1) * 1'000'000'000'000'000 - settings;
+    const int above =
+        half < 0 ? 1
+                 : compare_fractions(ratio, per, half,
+                                     10'000'000'000'000'000);  // 1e16
+    if (above < 0)
+      return stars;
+    if (above == 0)
+      return stars + stars % 2;
+  }
+}
+
+// --------------- osu.Game.Rulesets.Osu/Difficulty/Utils/LegacyScoreUtils.cs
+
+// The map's drain time in whole seconds, as osu!stable works it out: from
+// its first object's start to its last's, less its breaks.
+inline int drain_length(const Beatmap& map) {
+  if (map.objects.empty())
+    return 0;
+  int breaks = 0;
+  for (const Break& b : map.breaks)
+    breaks += static_cast<int>(round_half_even(b.end_time)) -
+              static_cast<int>(round_half_even(b.start_time));
+  return (static_cast<int>(round_half_even(map.objects.back().start_time)) -
+          static_cast<int>(round_half_even(map.objects.front().start_time)) -
+          breaks) /
+         1000;
+}
+
+// What osu!stable's score gives a spinner's spins: every full spin's, and
+// the bonus spins' after it's completed, as osu!stable needs it spun at
+// least 3 times a second and allows at most 477 a minute, halving the bonus
+// for an average case.
+inline double spinner_score(const HitObject& spinner) {
+  constexpr double maximum_rotations_per_second = 477.0 / 60;
+  constexpr double minimum_rotations_per_second = 3;
+  const double     seconds = (spinner.end_time - spinner.start_time) / 1000;
+  const int total_half_spins =
+      static_cast<int>(seconds * maximum_rotations_per_second * 2);
+  const int half_spins_to_complete =
+      static_cast<int>(seconds * minimum_rotations_per_second);
+  const int half_spins_before_bonus = half_spins_to_complete + 3;
+  long long score = 0;
+  const int full_spins = total_half_spins / 2;
+  score += 100LL * full_spins;
+  int bonus_spins = (total_half_spins - half_spins_before_bonus) / 2;
+  bonus_spins = std::max(0, bonus_spins - full_spins / 2);
+  score += 1000LL * bonus_spins;
+  return static_cast<double>(score);
+}
+
+// The score osu!stable gives the first `count` objects' slider parts and
+// spinner spins, per object.
+inline double nested_score_per_object(const std::vector<HitObject>& objects,
+                                      size_t                        count) {
+  int    big_ticks = 0, small_ticks = 0;
+  double spinners = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const HitObject& h = objects[i];
+    if (h.kind == HitObject::slider) {
+      // Its head, its tail and its repeats.
+      big_ticks += 2 + h.repeat_count;
+      for (const NestedObject& n : h.nested)
+        small_ticks += n.kind == NestedObject::tick;
+    } else if (h.kind == HitObject::spinner) {
+      spinners += spinner_score(h);
+    }
+  }
+  const double sliders = big_ticks * 30.0 + small_ticks * 10.0;
+  return (sliders + spinners) / static_cast<int>(count);
+}
+
+// ------------ osu.Game.Rulesets.Osu/Difficulty/OsuLegacyScoreSimulator.cs
+
+// A full combo of the first `count` objects as osu!stable scores it: its
+// combo, and the bonus its combo adds to each object's score with the map's
+// score multiplier.
+struct LegacyCombo {
+  long long score = 0;
+  int       combo = 0;
+};
+
+inline LegacyCombo legacy_combo(const std::vector<HitObject>& objects,
+                                size_t                        count,
+                                double                        multiplier) {
+  LegacyCombo c;
+  const auto  hit = [&](int score, bool adds_combo, bool combo_bonus) {
+    if (combo_bonus)
+      c.score += static_cast<int>(std::max(0, c.combo - 1) *
+                                  (score / 25 * multiplier));
+    if (adds_combo)
+      ++c.combo;
+  };
+  for (size_t i = 0; i < count; ++i) {
+    const HitObject& h = objects[i];
+    if (h.kind == HitObject::slider) {
+      for (const NestedObject& n : h.nested)
+        hit(n.kind == NestedObject::tick ? 10 : 30, true, false);
+      hit(300, false, true);
+    } else {
+      // A circle, or a spinner: its spins are bonus, outside the combo.
+      hit(300, true, true);
+    }
+  }
+  return c;
+}
+
 // ---------- osu.Game.Rulesets.Osu/Difficulty/OsuDifficultyCalculator.cs
 
 constexpr double performance_base_multiplier = 1.12;  // OsuPerformanceCalculator
@@ -1710,6 +1938,7 @@ inline double difficulty_rating(double value) { return std::sqrt(value) * 0.0675
 // A calculation's state: the map's objects and its skills as they've been
 // given objects so far.
 struct Calculation {
+  const Beatmap*                map;
   const Mods*                   mods;
   std::vector<Object>           objects;
   std::vector<DifficultyObject> difficulty_objects;
@@ -1719,7 +1948,7 @@ struct Calculation {
   Reading                       reading;
   std::optional<Flashlight>     flashlight;
 
-  Calculation(const Beatmap& map, const Mods& m) : mods(&m) {
+  Calculation(const Beatmap& map, const Mods& m) : map(&map), mods(&m) {
     objects.reserve(map.objects.size());
     for (const HitObject& h : map.objects)
       objects.push_back(make_object(h, map, m));
@@ -1760,6 +1989,20 @@ struct Calculation {
     Attributes a;
     if (counted == 0)
       return a;
+    for (size_t i = 0; i < counted; ++i) {
+      const HitObject::Kind kind = map->objects[i].kind;
+      a.hit_circle_count += kind == HitObject::circle;
+      a.slider_count += kind == HitObject::slider;
+      a.spinner_count += kind == HitObject::spinner;
+    }
+    a.nested_score_per_object = nested_score_per_object(map->objects, counted);
+    const int multiplier = difficulty_peppy_stars(
+        map->own_drain_rate, map->own_overall_difficulty, map->own_circle_size,
+        static_cast<int>(map->objects.size()), drain_length(*map));
+    a.legacy_score_base_multiplier = multiplier;
+    const LegacyCombo combo = legacy_combo(map->objects, counted, multiplier);
+    a.max_combo = combo.combo;
+    a.maximum_legacy_combo_score = static_cast<double>(combo.score);
     const double aim_value = aim.difficulty_value();
     const double aim_no_sliders_value = aim_no_sliders.difficulty_value();
     const double speed_value = speed.difficulty_value();

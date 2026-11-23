@@ -1,10 +1,11 @@
 // Compares osu-pp-cpp with osu!'s own calculation: each argument is a dump
 // from tools/reference (a map's playable objects with a play's mods, and
-// what osu! gave for them). The objects are rated here and every value is
-// checked against osu!'s, which it must equal exactly.
+// what osu! gave for them, and for made-up scores with them). The objects
+// are rated and the scores' pp calculated here, and every value is checked
+// against osu!'s, which it must equal exactly.
 //
 // Usage: compare <dump.txt>...    exits 1 if any value differs
-#include <osu_pp/difficulty.h>
+#include <osu_pp/performance.h>
 
 #include <cmath>
 #include <cstdio>
@@ -24,6 +25,8 @@ struct Reference {
   std::map<std::string, std::vector<double>> strains;
   // time, star rating, aim, speed, reading, flashlight ("none" as NaN)
   std::vector<std::vector<double>> timed;
+  // Each made-up score, and osu!'s performance attributes for it, as written.
+  std::vector<std::pair<osu_pp::Score, std::vector<std::string>>> scores;
 };
 
 double number(const std::string& text) {
@@ -45,6 +48,17 @@ Reference read(const char* path) {
       r.map.approach_rate = single(b);
       r.map.overall_difficulty = single(c);
       r.mods.clock_rate = number(d);
+    } else if (tag == "drain") {
+      in >> a;
+      r.map.drain_rate = single(a);
+    } else if (tag == "own") {
+      in >> a >> b >> c;
+      r.map.own_circle_size = single(a);
+      r.map.own_overall_difficulty = single(b);
+      r.map.own_drain_rate = single(c);
+    } else if (tag == "break") {
+      in >> a >> b;
+      r.map.breaks.push_back({number(a), number(b)});
     } else if (tag == "mods") {
       std::string mod;
       while (in >> mod) {
@@ -53,7 +67,29 @@ Reference read(const char* path) {
         r.mods.touch_device |= mod == "TD";
         r.mods.relax |= mod == "RX";
         r.mods.autopilot |= mod == "AP";
+        r.mods.no_fail |= mod == "NF";
+        r.mods.easy |= mod == "EZ";
+        r.mods.half_time |= mod == "HT" || mod == "DC";
+        r.mods.hard_rock |= mod == "HR";
+        r.mods.double_time |= mod == "DT" || mod == "NC";
+        r.mods.spun_out |= mod == "SO";
+        r.mods.blinds |= mod == "BL";
+        r.mods.traceable |= mod == "TC";
+        r.mods.score_v2 |= mod == "SV2";
+        r.mods.classic_slider_accuracy |= mod == "CL";
       }
+    } else if (tag == "score") {
+      osu_pp::Score score;
+      std::string   accuracy, total;
+      in >> accuracy >> score.max_combo >> score.great >> score.ok >> score.meh >>
+          score.miss >> score.slider_tail_hits >> score.large_tick_misses >> total;
+      score.accuracy = number(accuracy);
+      if (total != "none")
+        score.legacy_total_score = std::strtoll(total.c_str(), nullptr, 10);
+      r.scores.push_back({score, {}});
+    } else if (tag == "performance") {
+      while (in >> a)
+        r.scores.back().second.push_back(a);
     } else if (tag == "object") {
       osu_pp::HitObject h;
       std::string       kind, start, end, x, y;
@@ -156,6 +192,13 @@ int main(int argc, char** argv) {
         {"reading_difficult_note_count", a.reading_difficult_note_count},
         {"aim_top_weighted_slider_factor", a.aim_top_weighted_slider_factor},
         {"speed_top_weighted_slider_factor", a.speed_top_weighted_slider_factor},
+        {"max_combo", a.max_combo},
+        {"hit_circle_count", a.hit_circle_count},
+        {"slider_count", a.slider_count},
+        {"spinner_count", a.spinner_count},
+        {"nested_score_per_object", a.nested_score_per_object},
+        {"legacy_score_base_multiplier", a.legacy_score_base_multiplier},
+        {"maximum_legacy_combo_score", a.maximum_legacy_combo_score},
     };
     for (const auto& [name, ours] : values)
       c.check(name, ours, number(r.attributes.at(name)));
@@ -194,6 +237,32 @@ int main(int argc, char** argv) {
         c.check("timed flashlight" + at,
                 s.attributes.flashlight ? *s.attributes.flashlight : std::nan(""), t[5]);
       }
+    }
+    for (size_t k = 0; k < r.scores.size(); ++k) {
+      const auto& [score, theirs] = r.scores[k];
+      const osu_pp::Performance p = osu_pp::performance(a, r.map, r.mods, score);
+      const double ours[] = {
+          p.aim,
+          p.speed,
+          p.accuracy,
+          p.flashlight,
+          p.reading,
+          p.effective_miss_count,
+          p.combo_based_estimated_miss_count,
+          p.score_based_estimated_miss_count.value_or(std::nan("")),
+          p.aim_estimated_slider_breaks,
+          p.speed_estimated_slider_breaks,
+          p.speed_deviation.value_or(std::nan("")),
+          p.total,
+      };
+      constexpr const char* kNames[] = {
+          "aim", "speed", "accuracy", "flashlight", "reading", "effective_miss_count",
+          "combo_based_estimated_miss_count", "score_based_estimated_miss_count",
+          "aim_estimated_slider_breaks", "speed_estimated_slider_breaks",
+          "speed_deviation", "total"};
+      for (size_t v = 0; v < std::size(ours); ++v)
+        c.check("score " + std::to_string(k) + " pp " + kNames[v], ours[v],
+                number(theirs.at(v)));
     }
     if (c.failures) {
       std::printf("DIFFERS %s: %d values, worst relative %.3g\n", argv[i], c.failures, c.worst);

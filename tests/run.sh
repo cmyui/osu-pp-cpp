@@ -17,8 +17,13 @@ cmake --build "$work/build" --target compare > /dev/null
 [ $# -gt 0 ] || set -- "$root/tests/maps"
 find "$@" -name '*.osu' | while IFS= read -r map; do
   name=$(basename "$map" .osu | tr -c 'A-Za-z0-9\n' '_')
-  for mods in NM HD,HR DT FL,HD EZ,HT TD RX AP DA:cs=7:ar=10.5:od=9 DT@1.25; do
+  for mods in NM HD,HR DT FL,HD EZ,HT TD RX AP DA:cs=7:ar=10.5:od=9 DT@1.25 NF,SO SV2 BL TC NC,HD,FL; do
     dotnet "$reference" --timed "$mods" "$work/dumps/${name}_$(echo "$mods" | tr ':,=@.' '_____').txt" "$map"
+  done
+  # Scores set on osu!lazer without Classic: their slider tails and ticks
+  # judged, not estimated.
+  for mods in NM HD,DT; do
+    dotnet "$reference" --no-classic "$mods" "$work/dumps/${name}_lazer_$(echo "$mods" | tr ':,=@.' '_____').txt" "$map"
   done
 done
 "$work/build/compare" "$work"/dumps/*.txt
